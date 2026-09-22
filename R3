@@ -1,0 +1,674 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import streamlit as st
+
+
+# =========================================================
+# PAGE CONFIGURATION
+# =========================================================
+
+st.set_page_config(
+    page_title="Project R³ Digital Twin",
+    page_icon="🧬",
+    layout="wide",
+)
+
+st.title("Project R³ Digital Twin 🚀")
+st.caption(
+    "Decision-support model for evaluating urea recovery, energy consumption, "
+    "operating cost, and product routing."
+)
+
+st.warning(
+    "This is an engineering screening model, not a validated process-control system. "
+    "Calibrate recovery, energy, purity, and safety limits using pilot-plant data before operation."
+)
+
+
+# =========================================================
+# ENGINEERING MODEL FUNCTIONS
+# =========================================================
+
+UREA_MOLAR_MASS_G_PER_MOL = 60.06
+
+
+def feed_urea_mass_kg(volume_liters: float, concentration_mmol_l: float) -> float:
+    """
+    Converts urea concentration and liquid volume into total urea mass.
+
+    mmol/L × g/mol ÷ 1000 = g/L
+    """
+    grams_per_liter = (
+        concentration_mmol_l * UREA_MOLAR_MASS_G_PER_MOL / 1000
+    )
+    return volume_liters * grams_per_liter / 1000
+
+
+def extraction_efficiency(
+    voltage: float,
+    recovery_at_reference_voltage: float = 0.82,
+    reference_voltage: float = 6.0,
+) -> float:
+    """
+    Saturating empirical model.
+
+    This is intentionally bounded below 100%. Replace with pilot data
+    when available.
+    """
+    rate_constant = -np.log(
+        1 - recovery_at_reference_voltage
+    ) / reference_voltage
+
+    efficiency = 1 - np.exp(-rate_constant * voltage)
+
+    # Practical upper limit caused by membrane fouling, co-ion transport,
+    # osmotic losses, and incomplete concentration.
+    return float(np.clip(efficiency, 0, 0.95))
+
+
+def ed_specific_energy_kwh_per_kg(
+    voltage: float,
+    base_energy_kwh_per_kg: float = 1.35,
+    reference_voltage: float = 6.0,
+) -> float:
+    """
+    Approximate ED electricity consumption.
+
+    A quadratic voltage penalty represents increased current,
+    resistive losses, and reduced process efficiency at high voltage.
+    """
+    voltage_factor = (voltage / reference_voltage) ** 2
+    return base_energy_kwh_per_kg * voltage_factor
+
+
+def total_unit_cost_per_ton(
+    feed_urea_kg: float,
+    recovered_urea_kg: float,
+    energy_kwh_per_kg: float,
+    electricity_price: float,
+    membrane_cost_per_ton: float,
+    labor_cost_per_ton: float,
+    consumables_cost_per_ton: float,
+) -> float:
+    """Calculates production cost per metric ton of recovered urea."""
+    if recovered_urea_kg <= 0:
+        return np.inf
+
+    energy_cost = (
+        recovered_urea_kg
+        * energy_kwh_per_kg
+        * electricity_price
+    )
+
+    recovery_penalty = (
+        feed_urea_kg / recovered_urea_kg
+    )
+
+    variable_cost = (
+        energy_cost
+        + membrane_cost_per_ton * recovery_penalty
+        + labor_cost_per_ton
+        + consumables_cost_per_ton
+    )
+
+    return variable_cost / (recovered_urea_kg / 1000)
+
+
+def market_route(purity: float) -> tuple[str, str, str]:
+    """
+    Returns route, explanation, and severity level.
+
+    Thresholds should be verified against applicable standards,
+    customer specifications, and laboratory certificates.
+    """
+    if purity >= 99.8:
+        return (
+            "Automotive / DEF Candidate",
+            "Potentially suitable for further qualification against applicable DEF specifications.",
+            "success",
+        )
+    elif purity >= 99.5:
+        return (
+            "Industrial / Cosmetic Feedstock Candidate",
+            "Requires customer-specific testing for biuret, metals, chlorides, and other contaminants.",
+            "info",
+        )
+    else:
+        return (
+            "Agricultural / Industrial Grade Candidate",
+            "Use only after contaminant testing and confirmation of the intended application.",
+            "warning",
+        )
+
+
+# =========================================================
+# SIDEBAR INPUTS
+# =========================================================
+
+with st.sidebar:
+    st.header("Process Inputs")
+
+    st.subheader("Feed Characteristics")
+
+    feed_volume_l = st.number_input(
+        "Batch volume",
+        min_value=10.0,
+        max_value=100_000.0,
+        value=5_000.0,
+        step=100.0,
+        format="%.0f",
+        help="Total effluent volume processed in one batch.",
+    )
+
+    urea_concentration_mmol_l = st.number_input(
+        "Urea concentration",
+        min_value=1.0,
+        max_value=100.0,
+        value=30.0,
+        step=1.0,
+        help="Measured urea concentration in the incoming effluent.",
+    )
+
+    st.subheader("ED Operating Conditions")
+
+    voltage = st.slider(
+        "Applied ED voltage",
+        min_value=1.0,
+        max_value=15.0,
+        value=6.0,
+        step=0.5,
+        help="Operating voltage per selected ED stack configuration.",
+    )
+
+    reference_recovery = st.slider(
+        "Recovery at 6 V",
+        min_value=0.40,
+        max_value=0.95,
+        value=0.82,
+        step=0.01,
+        format="%.0%%",
+        help="Pilot-derived recovery estimate at the reference voltage.",
+    )
+
+    st.subheader("Economic Assumptions")
+
+    electricity_price = st.number_input(
+        "Electricity price (₹/kWh)",
+        min_value=0.0,
+        max_value=100.0,
+        value=8.0,
+        step=0.5,
+    )
+
+    membrane_cost_per_ton = st.number_input(
+        "Membrane and stack maintenance (₹/t feed)",
+        min_value=0.0,
+        max_value=100_000.0,
+        value=1_500.0,
+        step=100.0,
+    )
+
+    labor_cost_per_ton = st.number_input(
+        "Labor and utilities (₹/t product)",
+        min_value=0.0,
+        max_value=100_000.0,
+        value=2_000.0,
+        step=100.0,
+    )
+
+    consumables_cost_per_ton = st.number_input(
+        "Consumables and QA (₹/t product)",
+        min_value=0.0,
+        max_value=100_000.0,
+        value=1_000.0,
+        step=100.0,
+    )
+
+
+# =========================================================
+# CALCULATIONS
+# =========================================================
+
+feed_urea_kg = feed_urea_mass_kg(
+    feed_volume_l,
+    urea_concentration_mmol_l,
+)
+
+recovery = extraction_efficiency(
+    voltage,
+    recovery_at_reference_voltage=reference_recovery,
+)
+
+recovered_urea_kg = feed_urea_kg * recovery
+
+ed_energy_kwh_per_kg = ed_specific_energy_kwh_per_kg(voltage)
+
+ed_energy_kwh = recovered_urea_kg * ed_energy_kwh_per_kg
+
+electricity_cost = ed_energy_kwh * electricity_price
+
+estimated_unit_cost = total_unit_cost_per_ton(
+    feed_urea_kg=feed_urea_kg,
+    recovered_urea_kg=recovered_urea_kg,
+    energy_kwh_per_kg=ed_energy_kwh_per_kg,
+    electricity_price=electricity_price,
+    membrane_cost_per_ton=membrane_cost_per_ton,
+    labor_cost_per_ton=labor_cost_per_ton,
+    consumables_cost_per_ton=consumables_cost_per_ton,
+)
+
+
+# =========================================================
+# TABS
+# =========================================================
+
+tab1, tab2, tab3, tab4 = st.tabs(
+    [
+        "⚡ ED Optimizer",
+        "💰 Unit Economics",
+        "❄️ EFC vs Thermal",
+        "🏭 Market Router",
+    ]
+)
+
+
+# =========================================================
+# TAB 1: ED OPTIMIZER
+# =========================================================
+
+with tab1:
+    st.header("Electrodialysis Operating Window")
+
+    if voltage > 10:
+        st.warning(
+            "High-voltage operation selected. Validate membrane heating, "
+            "water splitting, fouling, and product degradation before use."
+        )
+
+    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+
+    metric_col1.metric(
+        "Urea in feed",
+        f"{feed_urea_kg:.2f} kg",
+    )
+
+    metric_col2.metric(
+        "Estimated recovery",
+        f"{recovery:.1%}",
+    )
+
+    metric_col3.metric(
+        "Recovered urea",
+        f"{recovered_urea_kg:.2f} kg",
+    )
+
+    metric_col4.metric(
+        "Specific energy",
+        f"{ed_energy_kwh_per_kg:.2f} kWh/kg",
+    )
+
+    st.divider()
+
+    voltage_range = np.arange(1.0, 15.1, 0.5)
+
+    recovery_curve = [
+        extraction_efficiency(
+            v,
+            recovery_at_reference_voltage=reference_recovery,
+        )
+        for v in voltage_range
+    ]
+
+    energy_curve = [
+        ed_specific_energy_kwh_per_kg(v)
+        for v in voltage_range
+    ]
+
+    fig, ax1 = plt.subplots(figsize=(10, 4.5))
+
+    ax1.plot(
+        voltage_range,
+        np.array(recovery_curve) * 100,
+        color="#1769aa",
+        marker="o",
+        label="Estimated urea recovery",
+    )
+
+    ax1.set_xlabel("Applied voltage (V)")
+    ax1.set_ylabel("Recovery (%)", color="#1769aa")
+    ax1.tick_params(axis="y", labelcolor="#1769aa")
+    ax1.set_ylim(0, 100)
+
+    ax2 = ax1.twinx()
+
+    ax2.plot(
+        voltage_range,
+        energy_curve,
+        color="#d62728",
+        marker="x",
+        label="Specific electricity use",
+    )
+
+    ax2.set_ylabel(
+        "Electricity consumption (kWh/kg recovered urea)",
+        color="#d62728",
+    )
+    ax2.tick_params(axis="y", labelcolor="#d62728")
+
+    ax1.axvline(
+        voltage,
+        color="green",
+        linestyle="--",
+        label=f"Selected voltage: {voltage:.1f} V",
+    )
+
+    ax1.grid(alpha=0.25)
+
+    lines_1, labels_1 = ax1.get_legend_handles_labels()
+    lines_2, labels_2 = ax2.get_legend_handles_labels()
+
+    ax1.legend(
+        lines_1 + lines_2,
+        labels_1 + labels_2,
+        loc="center right",
+    )
+
+    st.pyplot(fig, use_container_width=True)
+
+    st.subheader("Current batch summary")
+
+    summary_df = pd.DataFrame(
+        {
+            "Parameter": [
+                "Feed volume",
+                "Urea concentration",
+                "Urea mass in feed",
+                "Applied voltage",
+                "Estimated recovery",
+                "Recovered urea",
+                "ED electricity use",
+            ],
+            "Value": [
+                f"{feed_volume_l:,.0f} L",
+                f"{urea_concentration_mmol_l:.1f} mmol/L",
+                f"{feed_urea_kg:.2f} kg",
+                f"{voltage:.1f} V",
+                f"{recovery:.1%}",
+                f"{recovered_urea_kg:.2f} kg",
+                f"{ed_energy_kwh:,.2f} kWh",
+            ],
+        }
+    )
+
+    st.dataframe(
+        summary_df,
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+# =========================================================
+# TAB 2: UNIT ECONOMICS
+# =========================================================
+
+with tab2:
+    st.header("Unit Economics")
+
+    st.caption(
+        "Costs below are screening estimates. Add depreciation, wastewater "
+        "treatment, logistics, taxes, and financing costs for a full business case."
+    )
+
+    cost_col1, cost_col2, cost_col3 = st.columns(3)
+
+    cost_col1.metric(
+        "Electricity cost per batch",
+        f"₹{electricity_cost:,.2f}",
+    )
+
+    cost_col2.metric(
+        "Estimated cost per metric ton",
+        f"₹{estimated_unit_cost:,.2f}",
+    )
+
+    cost_col3.metric(
+        "Recovered product per batch",
+        f"{recovered_urea_kg:,.2f} kg",
+    )
+
+    st.divider()
+
+    cost_breakdown = pd.DataFrame(
+        {
+            "Cost category": [
+                "Electricity",
+                "Membrane and stack maintenance",
+                "Labor and utilities",
+                "Consumables and QA",
+            ],
+            "Estimated cost (₹)": [
+                electricity_cost,
+                membrane_cost_per_ton
+                * (feed_volume_l / 1000),
+                labor_cost_per_ton
+                * (recovered_urea_kg / 1000),
+                consumables_cost_per_ton
+                * (recovered_urea_kg / 1000),
+            ],
+        }
+    )
+
+    st.subheader("Estimated batch cost breakdown")
+    st.dataframe(
+        cost_breakdown.style.format(
+            {"Estimated cost (₹)": "₹{:,.2f}"}
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.info(
+        "The model treats recovered urea as the saleable product. "
+        "A full plant model should also include concentration, crystallization, "
+        "drying, packaging, reject handling, and laboratory certification."
+    )
+
+
+# =========================================================
+# TAB 3: EFC VS THERMAL
+# =========================================================
+
+with tab3:
+    st.header("EFC versus Thermal Distillation")
+
+    daily_volume_l = st.slider(
+        "Daily effluent processed",
+        min_value=100,
+        max_value=100_000,
+        value=5_000,
+        step=100,
+        format="%d L",
+    )
+
+    st.subheader("Technology assumptions")
+
+    efc_energy_kwh_l = st.number_input(
+        "EFC energy intensity (kWh/L)",
+        min_value=0.01,
+        max_value=2.0,
+        value=0.12,
+        step=0.01,
+        help="Replace with measured pilot or plant data.",
+    )
+
+    thermal_energy_kwh_l = st.number_input(
+        "Thermal energy intensity (kWh/L)",
+        min_value=0.01,
+        max_value=3.0,
+        value=0.65,
+        step=0.01,
+        help="Replace with measured thermal-process data.",
+    )
+
+    efc_cost = daily_volume_l * efc_energy_kwh_l * electricity_price
+    thermal_cost = (
+        daily_volume_l
+        * thermal_energy_kwh_l
+        * electricity_price
+    )
+
+    daily_savings = thermal_cost - efc_cost
+
+    comparison_col1, comparison_col2, comparison_col3 = st.columns(3)
+
+    comparison_col1.metric(
+        "EFC electricity cost/day",
+        f"₹{efc_cost:,.2f}",
+    )
+
+    comparison_col2.metric(
+        "Thermal electricity cost/day",
+        f"₹{thermal_cost:,.2f}",
+    )
+
+    comparison_col3.metric(
+        "Estimated daily difference",
+        f"₹{daily_savings:,.2f}",
+        delta=f"{(1 - efc_cost / thermal_cost) * 100:.1f}% lower"
+        if thermal_cost > 0
+        else None,
+    )
+
+    comparison_df = pd.DataFrame(
+        {
+            "Technology": [
+                "EFC",
+                "Thermal distillation",
+            ],
+            "Energy intensity (kWh/L)": [
+                efc_energy_kwh_l,
+                thermal_energy_kwh_l,
+            ],
+            "Daily energy use (kWh)": [
+                daily_volume_l * efc_energy_kwh_l,
+                daily_volume_l * thermal_energy_kwh_l,
+            ],
+            "Daily electricity cost (₹)": [
+                efc_cost,
+                thermal_cost,
+            ],
+        }
+    )
+
+    st.dataframe(
+        comparison_df.style.format(
+            {
+                "Energy intensity (kWh/L)": "{:.3f}",
+                "Daily energy use (kWh)": "{:,.2f}",
+                "Daily electricity cost (₹)": "₹{:,.2f}",
+            }
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.caption(
+        "Energy intensity alone does not establish process superiority. "
+        "Also compare water recovery, product quality, chemical consumption, "
+        "maintenance, emissions, and reject streams."
+    )
+
+
+# =========================================================
+# TAB 4: MARKET ROUTER
+# =========================================================
+
+with tab4:
+    st.header("Product Quality and Market Routing")
+
+    purity = st.slider(
+        "Measured urea purity",
+        min_value=90.0,
+        max_value=100.0,
+        value=99.8,
+        step=0.1,
+        format="%.1f%%",
+    )
+
+    st.subheader("Additional quality checks")
+
+    biuret_pass = st.checkbox(
+        "Biuret specification passed",
+        value=False,
+    )
+
+    metals_pass = st.checkbox(
+        "Heavy metals specification passed",
+        value=False,
+    )
+
+    chloride_pass = st.checkbox(
+        "Chloride specification passed",
+        value=False,
+    )
+
+    route, explanation, severity = market_route(purity)
+
+    automotive_qualified = (
+        purity >= 99.8
+        and biuret_pass
+        and metals_pass
+        and chloride_pass
+    )
+
+    if automotive_qualified:
+        st.success(
+            f"✅ ROUTE: {route}\n\n"
+            "Purity and all selected quality checks passed. "
+            "Final certification is still required."
+        )
+    elif purity >= 99.8:
+        st.warning(
+            "⚠️ ROUTE: Automotive / DEF candidate, pending qualification.\n\n"
+            "Purity is high enough for screening, but all required contaminant "
+            "and specification tests must pass before automotive use."
+        )
+    elif purity >= 99.5:
+        st.info(
+            f"🧴 ROUTE: {route}\n\n{explanation}"
+        )
+    else:
+        st.warning(
+            f"🌾 ROUTE: {route}\n\n{explanation}"
+        )
+
+    st.divider()
+
+    quality_df = pd.DataFrame(
+        {
+            "Quality attribute": [
+                "Urea purity",
+                "Biuret specification",
+                "Heavy metals specification",
+                "Chloride specification",
+            ],
+            "Result": [
+                f"{purity:.1f}%",
+                "Pass" if biuret_pass else "Not verified",
+                "Pass" if metals_pass else "Not verified",
+                "Pass" if chloride_pass else "Not verified",
+            ],
+        }
+    )
+
+    st.dataframe(
+        quality_df,
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.caption(
+        "Do not assign a product to a regulated or sensitive market based on purity alone. "
+        "Use a validated laboratory certificate and the applicable product standard."
+    )
